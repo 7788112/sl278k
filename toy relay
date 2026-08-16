@@ -16,7 +16,7 @@ current_command = {
     "vibrateMode": 1,
     "vibrate": 0,
     "suckMode": 0,    # 新增：吮吸模式
-    "suck": 0,        # 吮吸强度 0~16，0停止
+    "suck": 0,        # 吮吸强度 0~10，0停止
     "thrust": 0,
     "heat": 0,
     "timestamp": 0
@@ -35,7 +35,7 @@ class CmdBody(BaseModel):
 
 # 根据 suckMode、suck强度 生成吮吸串口帧 55 09 00 00 [mode] [intensity] 00
 def build_suck_frame(mode: int, intensity: int) -> bytearray:
-    intensity = max(0, min(intensity, 16))
+    intensity = max(0, min(intensity, 10))
     return bytearray([
         0x55,
         0x09,
@@ -62,12 +62,12 @@ def set_cmd(body: CmdBody):
     if body.suckMode is not None:
         current_command["suckMode"] = body.suckMode
 
-    # 吮吸强度：0~16，0停止
+    # 吮吸强度：0~10，0停止
     if body.suck is not None:
         if body.suck <= 0:
             current_command["suck"] = 0
         else:
-            current_command["suck"] = max(1, min(16, body.suck))
+            current_command["suck"] = max(1, min(10, body.suck))
 
     if body.thrust is not None:
         if body.thrust <= 0:
