@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SL278K Remote</title>
+<style>
+ body {font-family: "Microsoft YaHei",sans-serif;background:#fff0f6;color:#883366;padding:24px;max-width:520px;margin:0 auto;}
+ h2 {color:#d868a2;text-align:center;}
+ button{background:#f8b8d4;color:#702852;border:none;border-radius:22px;padding:12px 20px;margin:6px;font-size:15px;cursor:pointer;transition:0.2s;}
+ button:hover{background:#f498c0;}
+ #log{background:#ffe6f2;color:#772e59;padding:12px;border-radius:14px;height:300px;overflow:auto;margin-top:12px;white-space:pre-wrap;}
+ .on{color:#22aa55;font-weight:bold;}
+ .off{color:#dd4466;font-weight:bold;}
+ .info-line{margin:8px 0;font-size:15px;}
+</style>
+</head>
+<body>
+<h2>🎀 SL278K 遥控器</h2>
+<div class="info-line">蓝牙状态：<span id="bleStat" class="off">未连接</span></div>
+<div class="info-line">服务器状态：<span id="srvStat" class="off">未连接</span></div>
+<div class="info-line">当前指令：<span id="curCmd">无</span></div>
+<br/>
+<button onclick="connectBle()">连接设备</button>
+<button onclick="startPoll()">开始轮询服务器</button>
+<button onclick="stopAll()">🛑紧急全局停止</button>
+<div id="log"></div>
+
+<script>
+const SERVER = "http://127.0.0.1:8899";
+const SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb';
+const WRITE_CHAR_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb';
+
+let device=null;
+let writeChar=null;
+let pollTimer=null;
+let emergencyStopFlag = false;
+
+// 同步后端字段，增加 suckMode
+let lastCmd={vibrateMode:1, vibrate:0, suckMode:0, suck:0, thrust:0, heat:0,timestamp:0};
+
+const logDiv=document.getElementById("log");
+const bleStat=document.getElementById("bleStat");
+const srvStat=document.getElementById("srvStat");
+const curCmd=document.getElementById("curCmd");
+
+function log(txt){
+    logDiv.innerText+=(new Date().toLocaleTimeString())+" "+txt+"\n";
+    logDiv.scrollTop=logDiv.scrollHeight;
+}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+async function connectBle(){
+    try{
+        log("扫描蓝牙设备");
+        device=await navigator.bluetooth.requestDevice({
+            filters:[{namePrefix:"SL278"}],
+            optionalServices:[SERVICE_UUID]
+        });
+        device.addEventListener('gattserverdisconnected',()=>{
+            bleStat.className="off";bleStat.innerText="断开";log("蓝牙断开");
+        })
+        const gatt=await device.gatt.connect();
+        const service=await gatt.getPrimaryService(SERVICE_UUID);
+        writeChar=await service.getCharacteristic(WRITE_CHAR_UUID);
+        bleStat.className="on";bleStat.innerText="已连接";
+        log("✅蓝牙连接成功，拿到FFE1写特征");
+    }catch(e){
+        log("❌蓝牙错误："+e.message);
+        console.error(e);
+    }
+}
+
+// ==========各个通道独立停止帧==========
+//0x03震动停止
+function stopVibrate(){return new Uint8Array([0x55,0x03,0x00,0x00,0x00,0x00,0x00]);}
+//0x09吮吸停止（更新为新命令码）
+function stopSuck(){return new Uint8Array([0x55,0x09,0x00,0x00,0x00,0x00,0x00]);}
+//0x08伸缩停止
+function stopThrust(){return new Uint8Array([0x55,0x08,0x00,0x00,0x00,0x00,0x00]);}
+//0x04自动模式停止
+function stopAutoMode(){return new Uint8Array([0x55,0x04,0x00,0x00,0x00,0x00,0xAA]);}
+//0x05加热关闭
+function stopHeat(){return new Uint8Array([0x55,0x05,0x00,0x00,0x00,0x00,0x00]);}
+
+//0x03震动 frame mode:1‑10 level:1‑10
+function makeVibrateFrame(mode,level){
+    return new Uint8Array([0x55,0x03,0x00,0x00,mode,level,0x00]);
+}
+
+// ✅新吮吸帧 0x09：55 09 00 00 [suckMode] [强度] 00，强度0‑16
+function makeSuckFrame(suckMode, level){
+    const lvl = Math.max(0, Math.min(16, level));
+    const m = suckMode ?? 0;
+    return new Uint8Array([0x55,0x09,0x00,0x00, m & 0xFF, lvl & 0xFF, 0x00]);
+}
+
+//0x08伸缩 thrust档位1‑7
+function makeThrustFrame(level){
+    return new Uint8Array([0x55,0x08,0x00,0x00,level,0x00,0x00]);
+}
+//0x05加热 temp摄氏度 0x37=55℃
+function makeHeatFrame(isOn){
+    if(isOn){
+        return new Uint8Array([0x55,0x05,0x01,0x37,0x00,0x00,0x00]);
+    }else{
+        return stopHeat();
+    }
+}
+
+async function writeCmd(cmd){
+    if(!writeChar){
+        log("⚠️蓝牙特征未就绪，跳过发送");
+        return;
+    }
+    if(emergencyStopFlag){
+        if(cmd.vibrate===0 && cmd.suck===0 && cmd.thrust===0 && cmd.heat===0){
+            emergencyStopFlag = false;
+            log("✅收到清零指令，解除紧急停止锁");
+        }else{
+            log("🚫紧急停止锁生效，拒绝新动作指令");
+            return;
+        }
+    }
+    log("📤准备输出指令："+JSON.stringify(cmd));
+
+    //震动0x03
+    if(cmd.vibrate>0){
+        const mode = Math.max(1,Math.min(10,cmd.vibrateMode||1));
+        const lvl = Math.max(1,Math.min(10,cmd.vibrate));
+        const fVib=makeVibrateFrame(mode,lvl);
+        console.log("0x03震动帧",Array.from(fVib));
+        await writeChar.writeValueWithoutResponse(fVib);
+        await sleep(60);
+    }else{
+        await writeChar.writeValueWithoutResponse(stopVibrate());
+        await sleep(60);
+    }
+
+    // ✅吮吸 0x09，读取suckMode
+    if(cmd.suck>0){
+        const suckMode = cmd.suckMode ?? 0;
+        const lvl=Math.max(1,Math.min(16,cmd.suck));
+        const fSuck=makeSuckFrame(suckMode, lvl);
+        console.log("0x09吮吸帧",Array.from(fSuck));
+        await writeChar.writeValueWithoutResponse(fSuck);
+        await sleep(60);
+    }else{
+        await writeChar.writeValueWithoutResponse(stopSuck());
+        await sleep(60);
+    }
+
+    //伸缩 thrust 0x08
+    if(cmd.thrust>0){
+        const lvl=Math.max(1,Math.min(7,cmd.thrust));
+        const fThrust=makeThrustFrame(lvl);
+        console.log("0x08伸缩帧",Array.from(fThrust));
+        await writeChar.writeValueWithoutResponse(fThrust);
+        await sleep(60);
+    }else{
+        await writeChar.writeValueWithoutResponse(stopThrust());
+        await sleep(60);
+    }
+
+    //加热
+    const fHeat=makeHeatFrame(cmd.heat>0);
+    console.log("0x05加热帧",Array.from(fHeat));
+    await writeChar.writeValueWithoutResponse(fHeat);
+    await sleep(60);
+}
+
+async function pollOnce(){
+    try{
+        const res=await fetch(SERVER+"/poll");
+        const data=await res.json();
+        srvStat.className="on";srvStat.innerText="已连接";
+        curCmd.innerText=JSON.stringify(data);
+        if(JSON.stringify(data)!==JSON.stringify(lastCmd)){
+            log("收到新指令 "+JSON.stringify(data));
+            await writeCmd(data);
+            lastCmd={...data};
+        }
+    }catch(e){
+        srvStat.className="off";srvStat.innerText="异常";
+        console.error("poll错误",e);
+    }
+}
+
+function startPoll(){
+    if(pollTimer) return;
+    pollOnce();
+    pollTimer=setInterval(pollOnce,1000);
+    log("⏱开始轮询服务器指令");
+}
+
+//全通道独立停止，每个部件发自己的停止帧，间隔60ms
+async function stopAll(){
+    emergencyStopFlag = true;
+    lastCmd={vibrateMode:1, vibrate:0,suckMode:0, suck:0,thrust:0,heat:0,timestamp:0};
+    if(writeChar){
+        await writeChar.writeValueWithoutResponse(stopVibrate());
+        await sleep(60);
+        await writeChar.writeValueWithoutResponse(stopSuck());
+        await sleep(60);
+        await writeChar.writeValueWithoutResponse(stopThrust());
+        await sleep(60);
+        await writeChar.writeValueWithoutResponse(stopAutoMode());
+        await sleep(60);
+        await writeChar.writeValueWithoutResponse(stopHeat());
+    }
+    log("🛑🛑紧急全局停止，全部通道分别下发停止帧，开启停止锁");
+}
+</script>
+</body>
+</html>
