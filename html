@@ -1,200 +1,187 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh‑CN">
 <head>
-<meta charset="utf-8">
-<title>SL278K Remote</title>
+<meta charset="utf‑8">
+<title>SL278 BLE Bridge Client（带0x04自动模式）</title>
 <style>
- body {font-family: "Microsoft YaHei",sans-serif;background:#fff0f6;color:#883366;padding:24px;max-width:520px;margin:0 auto;}
- h2 {color:#d868a2;text-align:center;}
- button{background:#f8b8d4;color:#702852;border:none;border-radius:22px;padding:12px 20px;margin:6px;font-size:15px;cursor:pointer;transition:0.2s;}
- button:hover{background:#f498c0;}
- #log{background:#ffe6f2;color:#772e59;padding:12px;border-radius:14px;height:300px;overflow:auto;margin-top:12px;white-space:pre-wrap;}
- .on{color:#22aa55;font-weight:bold;}
- .off{color:#dd4466;font-weight:bold;}
- .info-line{margin:8px 0;font-size:15px;}
+body{font-family:system-ui;max-width:800px;margin:12px;}
+pre{background:#f5f5f5;padding:8px;overflow:auto;font-size:12px;}
 </style>
 </head>
 <body>
-<h2>🎀 SL278K 遥控器</h2>
-<div class="info-line">蓝牙状态：<span id="bleStat" class="off">未连接</span></div>
-<div class="info-line">服务器状态：<span id="srvStat" class="off">未连接</span></div>
-<div class="info-line">当前指令：<span id="curCmd">无</span></div>
-<br/>
-<button onclick="connectBle()">连接设备</button>
-<button onclick="startPoll()">开始轮询服务器</button>
-<button onclick="stopAll()">🛑紧急全局停止</button>
-<div id="log"></div>
+<h2>SL278 BLE桥接｜WebBluetooth</h2>
+<div>
+<button id="connectBtn">连接蓝牙 SL278</button>
+<button id="fullStopBtn">全部硬件停止</button>
+</div>
+<div>
+<p>服务端地址：<input id="serverUrl" value="https://mcp.anchordomain.top" style="width:420px;"></p>
+<p>状态日志：</p>
+<pre id="log"></pre>
+</div>
 
 <script>
-const SERVER = "http://127.0.0.1:8899";
-const SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb';
-const WRITE_CHAR_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb';
+const SERVER_INPUT = document.getElementById('serverUrl');
+const CONNECT_BTN = document.getElementById('connectBtn');
+const STOP_BTN = document.getElementById('fullStopBtn');
+const LOG_PRE = document.getElementById('log');
 
-let device=null;
-let writeChar=null;
-let pollTimer=null;
-let emergencyStopFlag = false;
+let device = null;
+let writeChar = null;
+let pollTimer = null;
+let autoKeepAliveTimer = null;
 
-let lastCmd={vibrateMode:1, vibrate:0, suckMode:0, suck:0, thrust:0, heat:0,timestamp:0};
-
-const logDiv=document.getElementById("log");
-const bleStat=document.getElementById("bleStat");
-const srvStat=document.getElementById("srvStat");
-const curCmd=document.getElementById("curCmd");
+// 发送帧队列，强制帧间隔60ms
+const frameQueue = [];
+let queueBusy = false;
 
 function log(txt){
-    logDiv.innerText+=(new Date().toLocaleTimeString())+" "+txt+"\n";
-    logDiv.scrollTop=logDiv.scrollHeight;
+    LOG_PRE.innerText += new Date().toLocaleTimeString() + " " + txt + "\n";
+    LOG_PRE.scrollTop = LOG_PRE.scrollHeight;
 }
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-async function connectBle(){
-    try{
-        log("扫描蓝牙设备");
-        device=await navigator.bluetooth.requestDevice({
-            filters:[{namePrefix:"SL278"}],
-            optionalServices:[SERVICE_UUID]
-        });
-        device.addEventListener('gattserverdisconnected',()=>{
-            bleStat.className="off";bleStat.innerText="断开";log("蓝牙断开");
-        })
-        const gatt=await device.gatt.connect();
-        const service=await gatt.getPrimaryService(SERVICE_UUID);
-        writeChar=await service.getCharacteristic(WRITE_CHAR_UUID);
-        bleStat.className="on";bleStat.innerText="已连接";
-        log("✅蓝牙连接成功，拿到FFE1写特征");
-    }catch(e){
-        log("❌蓝牙错误："+e.message);
-        console.error(e);
+async function sendFrame(buf){
+    if(!writeChar){log("未连接BLE，丢弃帧");return;}
+    frameQueue.push(buf);
+    await drainQueue();
+}
+
+async function drainQueue(){
+    if(queueBusy) return;
+    queueBusy = true;
+    while(frameQueue.length>0){
+        const f = frameQueue.shift();
+        try{
+            await writeChar.writeWithoutResponse(f);
+            log("TX: "+ Array.from(f).map(x=>x.toString(16).padStart(2,'0')).join(" "));
+        }catch(e){
+            log("发送失败 "+e.message);
+        }
+        await sleep(60); //协议强制间隔≥60ms
     }
+    queueBusy = false;
 }
 
-// ==========各个通道独立停止帧==========
-function stopVibrate(){return new Uint8Array([0x55,0x03,0x00,0x00,0x00,0x00,0x00]);}
-function stopSuck(){return new Uint8Array([0x55,0x09,0x00,0x00,0x00,0x00,0x00]);}
-function stopThrust(){return new Uint8Array([0x55,0x08,0x00,0x00,0x00,0x00,0x00]);}
-function stopAutoMode(){return new Uint8Array([0x55,0x04,0x00,0x00,0x00,0x00,0xAA]);}
-function stopHeat(){return new Uint8Array([0x55,0x05,0x00,0x00,0x00,0x00,0x00]);}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
-function makeVibrateFrame(mode,level){
-    return new Uint8Array([0x55,0x03,0x00,0x00,mode,level,0x00]);
+// 帧生成逻辑（和后端保持一致）
+function buildSuckFrame(mode,intensity){
+    return new Uint8Array([0x55,0x09,0x00,0x00,mode,intensity,0x00]);
 }
-
-// 吮吸帧：55 09 00 00 [模式(1‑5)] [强度(1‑10)] 00
-function makeSuckFrame(suckMode, level){
-    const m = Math.max(0, Math.min(5, suckMode ?? 0));
-    const lvl = Math.max(0, Math.min(10, level));
-    return new Uint8Array([0x55,0x09,0x00,0x00, m & 0xFF, lvl & 0xFF, 0x00]);
+function buildVibrateFrame(mode,intensity){
+    return new Uint8Array([0x55,0x03,0x00,0x00,mode,intensity,0x00]);
 }
-
-function makeThrustFrame(level){
-    return new Uint8Array([0x55,0x08,0x00,0x00,level,0x00,0x00]);
-}
-function makeHeatFrame(isOn){
-    if(isOn){
-        return new Uint8Array([0x55,0x05,0x01,0x37,0x00,0x00,0x00]);
+function buildAutoFrame(enable,strength){
+    if(enable){
+        return new Uint8Array([0x55,0x04,0x00,0x00,0x01,strength,0xAA]);
     }else{
-        return stopHeat();
+        return new Uint8Array([0x55,0x04,0x00,0x00,0x00,0x00,0xAA]);
     }
 }
+function buildThrustFrame(lv){
+    return new Uint8Array([0x55,0x08,0x00,0x00,lv,0x00,0x00]);
+}
+function buildHeatFrame(on,temp=52){
+    if(!on) return new Uint8Array([0x55,0x05,0x00,0x00,0x00,0x00,0x00]);
+    return new Uint8Array([0x55,0x05,0x01,temp,0x00,0x00,0x00]);
+}
 
-async function writeCmd(cmd){
-    if(!writeChar){
-        log("⚠️蓝牙特征未就绪，跳过发送");
-        return;
-    }
-    if(emergencyStopFlag){
-        if(cmd.vibrate===0 && cmd.suck===0 && cmd.thrust===0 && cmd.heat===0){
-            emergencyStopFlag = false;
-            log("✅收到清零指令，解除紧急停止锁");
-        }else{
-            log("🚫紧急停止锁生效，拒绝新动作指令");
+let lastState = null;
+
+// poll轮询后端状态
+async function pollServer(){
+    const base = SERVER_INPUT.value.trim();
+    try{
+        const resp = await fetch(base+"/poll");
+        const state = await resp.json();
+        if(!lastState){
+            lastState = JSON.parse(JSON.stringify(state));
             return;
         }
+        // 对比状态变更，发送对应硬件帧
+        await diffAndSend(lastState, state);
+        lastState = JSON.parse(JSON.stringify(state));
+    }catch(err){
+        log("poll error "+err.message);
     }
-    log("📤准备输出指令："+JSON.stringify(cmd));
-
-    if(cmd.vibrate>0){
-        const mode = Math.max(1,Math.min(10,cmd.vibrateMode||1));
-        const lvl = Math.max(1,Math.min(10,cmd.vibrate));
-        const fVib=makeVibrateFrame(mode,lvl);
-        console.log("0x03震动帧",Array.from(fVib));
-        await writeChar.writeValueWithoutResponse(fVib);
-        await sleep(60);
-    }else{
-        await writeChar.writeValueWithoutResponse(stopVibrate());
-        await sleep(60);
-    }
-
-    if(cmd.suck>0){
-        const suckMode = cmd.suckMode ?? 1;
-        const lvl=Math.max(1,Math.min(10,cmd.suck));
-        const fSuck=makeSuckFrame(suckMode, lvl);
-        console.log("0x09吮吸帧",Array.from(fSuck));
-        await writeChar.writeValueWithoutResponse(fSuck);
-        await sleep(60);
-    }else{
-        await writeChar.writeValueWithoutResponse(stopSuck());
-        await sleep(60);
-    }
-
-    if(cmd.thrust>0){
-        const lvl=Math.max(1,Math.min(7,cmd.thrust));
-        const fThrust=makeThrustFrame(lvl);
-        console.log("0x08伸缩帧",Array.from(fThrust));
-        await writeChar.writeValueWithoutResponse(fThrust);
-        await sleep(60);
-    }else{
-        await writeChar.writeValueWithoutResponse(stopThrust());
-        await sleep(60);
-    }
-
-    const fHeat=makeHeatFrame(cmd.heat>0);
-    console.log("0x05加热帧",Array.from(fHeat));
-    await writeChar.writeValueWithoutResponse(fHeat);
-    await sleep(60);
 }
 
-async function pollOnce(){
-    try{
-        const res=await fetch(SERVER+"/poll");
-        const data=await res.json();
-        srvStat.className="on";srvStat.innerText="已连接";
-        curCmd.innerText=JSON.stringify(data);
-        if(JSON.stringify(data)!==JSON.stringify(lastCmd)){
-            log("收到新指令 "+JSON.stringify(data));
-            await writeCmd(data);
-            lastCmd={...data};
+async function diffAndSend(oldS, newS){
+    // 吮吸变化
+    if(oldS.suckMode !== newS.suckMode || oldS.suck !== newS.suck){
+        await sendFrame(buildSuckFrame(newS.suckMode, newS.suck));
+    }
+    //普通震动变化
+    if(oldS.vibrateMode !== newS.vibrateMode || oldS.vibrate !== newS.vibrate){
+        await sendFrame(buildVibrateFrame(newS.vibrateMode, newS.vibrate));
+    }
+    //自动模式处理：开启则启动1500ms保活定时器；关闭销毁定时器发送停止帧
+    if(oldS.autoMode !== newS.autoMode || oldS.autoStrength !== newS.autoStrength){
+        if(autoKeepAliveTimer) clearInterval(autoKeepAliveTimer);
+        if(newS.autoMode ===1){
+            log("autoMode ON，启动1500ms保活");
+            await sendFrame(buildAutoFrame(true, newS.autoStrength));
+            autoKeepAliveTimer = setInterval(async ()=>{
+                await sendFrame(buildAutoFrame(true, newS.autoStrength));
+            },1500);
+        }else{
+            log("autoMode OFF，发送auto停止帧");
+            await sendFrame(buildAutoFrame(false,0));
         }
+    }
+    //伸缩
+    if(oldS.thrust !== newS.thrust){
+        await sendFrame(buildThrustFrame(newS.thrust));
+    }
+    //加热
+    if(oldS.heat !== newS.heat){
+        await sendFrame(buildHeatFrame(!!newS.heat));
+    }
+}
+
+// 全部停止，调用后端stop接口，拿到全部停止帧序列依次发送
+async function fullHardwareStop(){
+    log("执行全部硬件停止");
+    if(autoKeepAliveTimer){
+        clearInterval(autoKeepAliveTimer);
+        autoKeepAliveTimer = null;
+    }
+    const base = SERVER_INPUT.value.trim();
+    const res = await fetch(base+"/stop",{method:"POST"});
+    const data = await res.json();
+    //后端返回hex字符串数组 stop_frames_hex
+    for(const hexStr of data.stop_frames_hex){
+        const arr = hexStr.split(" ").map(s=>parseInt(s,16));
+        await sendFrame(new Uint8Array(arr));
+    }
+}
+
+// 蓝牙连接
+CONNECT_BTN.onclick = async ()=>{
+    try{
+        log("开始扫描SL278设备");
+        device = await navigator.bluetooth.requestDevice({
+            filters:[{namePrefix:"SL278"}],
+            optionalServices:["ffe0"]
+        });
+        const gatt = await device.gatt.connect();
+        const service = await gatt.getPrimaryService(0xffe0);
+        writeChar = await service.getCharacteristic(0xffe1);
+        log("BLE已连接 ffe1 write‑without‑response");
+        //启动poll
+        if(pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(pollServer,400);
     }catch(e){
-        srvStat.className="off";srvStat.innerText="异常";
-        console.error("poll错误",e);
+        log("连接失败："+e.message);
     }
-}
+};
 
-function startPoll(){
-    if(pollTimer) return;
-    pollOnce();
-    pollTimer=setInterval(pollOnce,1000);
-    log("⏱开始轮询服务器指令");
-}
+STOP_BTN.onclick = fullHardwareStop;
 
-async function stopAll(){
-    emergencyStopFlag = true;
-    lastCmd={vibrateMode:1, vibrate:0,suckMode:0, suck:0,thrust:0,heat:0,timestamp:0};
-    if(writeChar){
-        await writeChar.writeValueWithoutResponse(stopVibrate());
-        await sleep(60);
-        await writeChar.writeValueWithoutResponse(stopSuck());
-        await sleep(60);
-        await writeChar.writeValueWithoutResponse(stopThrust());
-        await sleep(60);
-        await writeChar.writeValueWithoutResponse(stopAutoMode());
-        await sleep(60);
-        await writeChar.writeValueWithoutResponse(stopHeat());
-    }
-    log("🛑🛑紧急全局停止，全部通道分别下发停止帧，开启停止锁");
-}
+window.addEventListener('beforeunload',()=>{
+    if(autoKeepAliveTimer) clearInterval(autoKeepAliveTimer);
+    if(pollTimer) clearInterval(pollTimer);
+});
 </script>
 </body>
 </html>
