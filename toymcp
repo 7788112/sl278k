@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import time
 import json
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, List
 from sse_starlette.sse import EventSourceResponse
 
 app = FastAPI()
@@ -21,74 +21,100 @@ current_command = {
     "vibrate": 0,
     "suckMode": 0,
     "suck": 0,
+    "autoMode": 0,       # 新增：0关闭，1开启0x04自动模式
+    "autoStrength": 128, # 0‑255 自动模式强度
     "thrust": 0,
     "heat": 0,
     "timestamp": 0
 }
 bridge_status = {"last_poll": 0}
 
-
 class CmdBody(BaseModel):
     vibrateMode: int | None = None
     vibrate: int | None = None
     suckMode: int | None = None
     suck: int | None = None
+    autoMode: int | None = None
+    autoStrength: int | None = None
     thrust: int | None = None
     heat: int | None = None
 
+# 吮吸 0x09
+def build_suck_frame(mode: int, intensity: int) -> bytearray:
+    mode = max(0, min(5, mode))
+    intensity = max(0, min(10, intensity))
+    return bytearray([0x55,0x09,0x00,0x00,mode & 0xFF,intensity & 0xFF,0x00])
+
+# 普通震动 0x03
+def build_vibrate_frame(mode:int, intensity:int) -> bytearray:
+    return bytearray([0x55,0x03,0x00,0x00,mode &0xFF, intensity&0xFF, 0x00])
+
+# 自动模式 0x04；注意结尾是AA，不是00
+def build_auto_frame(enable:bool, strength:int) -> bytearray:
+    strength = max(0, min(255, strength))
+    if enable:
+        return bytearray([0x55,0x04,0x00,0x00,0x01, strength &0xFF, 0xAA])
+    else:
+        return bytearray([0x55,0x04,0x00,0x00,0x00, 0x00, 0xAA])
+
+# 伸缩 0x08
+def build_thrust_frame(level:int) -> bytearray:
+    lv = max(0, min(7, level))
+    return bytearray([0x55,0x08,0x00,0x00, lv &0xFF, 0x00, 0x00])
+
+# 加热 0x05
+def build_heat_frame(on:bool, temp_c:int=52) -> bytearray:
+    if not on:
+        return bytearray([0x55,0x05,0x00,0x00,0x00,0x00,0x00])
+    t = max(40, min(55, temp_c))
+    return bytearray([0x55,0x05,0x01, t &0xFF, 0x00,0x00,0x00])
+
+# 全部通道独立停止帧（包含0x04自动模式）
+def get_all_stop_frames() -> List[bytearray]:
+    return [
+        build_vibrate_frame(0,0),
+        build_suck_frame(0,0),
+        build_auto_frame(False,0),
+        build_thrust_frame(0),
+        build_heat_frame(False)
+    ]
 
 @app.post("/cmd")
 def set_cmd(body: CmdBody):
+    # vibrateMode：大于0才限制范围，0代表关闭
     if body.vibrateMode is not None:
-        current_command["vibrateMode"] = max(1, min(10, body.vibrateMode))
-
+        current_command["vibrateMode"] = max(1, min(10, body.vibrateMode)) if body.vibrateMode>0 else 1
     if body.vibrate is not None:
-        if body.vibrate <= 0:
-            current_command["vibrate"] = 0
-        else:
-            current_command["vibrate"] = max(1, min(10, body.vibrate))
+        current_command["vibrate"] = max(1, min(10, body.vibrate)) if body.vibrate>0 else 0
 
-    # 吮吸模式 1‑5，0为停止
     if body.suckMode is not None:
-        if body.suckMode <= 0:
-            current_command["suckMode"] = 0
-        else:
-            current_command["suckMode"] = max(1, min(5, body.suckMode))
-
-    # 吮吸强度 1‑10，0关闭
+        current_command["suckMode"] = max(1, min(5, body.suckMode)) if body.suckMode>0 else 0
     if body.suck is not None:
-        if body.suck <= 0:
-            current_command["suck"] = 0
-        else:
-            current_command["suck"] = max(1, min(10, body.suck))
+        current_command["suck"] = max(1, min(10, body.suck)) if body.suck>0 else 0
+
+    if body.autoMode is not None:
+        current_command["autoMode"] = 1 if body.autoMode>0 else 0
+    if body.autoStrength is not None:
+        current_command["autoStrength"] = max(0, min(255, body.autoStrength))
 
     if body.thrust is not None:
-        if body.thrust <= 0:
-            current_command["thrust"] = 0
-        else:
-            current_command["thrust"] = max(1, min(7, body.thrust))
+        current_command["thrust"] = max(1, min(7, body.thrust)) if body.thrust>0 else 0
 
     if body.heat is not None:
-        if body.heat <= 0:
-            current_command["heat"] = 0
-        else:
-            current_command["heat"] = 1
+        current_command["heat"] = 1 if body.heat>0 else 0
 
     current_command["timestamp"] = time.time()
     return {"status": "ok", "cmd": current_command}
-
 
 @app.get("/poll")
 def poll():
     bridge_status["last_poll"] = time.time()
     return current_command
 
-
 @app.get("/status")
 def status():
     alive = (time.time() - bridge_status["last_poll"]) < 10
     return {"bridge_alive": alive, "current": current_command}
-
 
 @app.post("/stop")
 def stop_all():
@@ -96,132 +122,112 @@ def stop_all():
     current_command["vibrate"] = 0
     current_command["suckMode"] = 0
     current_command["suck"] = 0
+    current_command["autoMode"] = 0
+    current_command["autoStrength"] = 128
     current_command["thrust"] = 0
     current_command["heat"] = 0
     current_command["timestamp"] = time.time()
-    return {"status": "stopped"}
+    stop_hex = [f.hex(" ") for f in get_all_stop_frames()]
+    return {"status":"stopped","stop_frames_hex":stop_hex}
 
-
-def build_suck_frame(mode: int, intensity: int):
-    """帧: 55 09 00 00 [mode] [intensity] 00"""
-    mode = max(0, min(5, mode))
-    intensity = max(0, min(10, intensity))
-    return bytearray([
-        0x55,
-        0x09,
-        0x00,
-        0x00,
-        mode & 0xFF,
-        intensity & 0xFF,
-        0x00
-    ])
-
-
-@app.get("/debug/suck_frame")
-def debug_suck(mode: int = 2, intensity: int = 5):
-    frame_bytes = build_suck_frame(mode, intensity)
+@app.get("/debug/sl278h_frames")
+def debug_frames(
+    vibrateMode:int=3, vibrate:int=5,
+    suckMode:int=3, suck:int=6,
+    autoStrength:int=128, thrust:int=3, heat:int=1
+):
     return {
-        "hex": frame_bytes.hex(" "),
-        "bytes": list(frame_bytes)
+        "vibrate_frame": build_vibrate_frame(vibrateMode, vibrate).hex(" "),
+        "suck_frame": build_suck_frame(suckMode, suck).hex(" "),
+        "auto_frame_on": build_auto_frame(True,autoStrength).hex(" "),
+        "auto_frame_off": build_auto_frame(False,0).hex(" "),
+        "thrust_frame": build_thrust_frame(thrust).hex(" "),
+        "heat_frame": build_heat_frame(bool(heat)).hex(" "),
+        "stop_frames": [f.hex(" ") for f in get_all_stop_frames()]
     }
 
-# ================= MCP SSE /mcp =================
+# ========= MCP‑SSE，新增autoMode、autoStrength参数说明 =========
 MCP_TOOLS_DEF = [
     {
-        "name": "set_device_cmd",
-        "description": "下发设备控制指令。吮吸模式1‑5，吮吸强度1‑10；震动模式1‑10，震动强度1‑10；伸缩1‑7；heat 0/1。字段为0代表关闭该功能。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "vibrateMode": {"type": "integer", "description": "震动模式 1‑10", "minimum": 1, "maximum": 10},
-                "vibrate": {"type": "integer", "description": "震动强度，0关闭，1‑10", "minimum": 0, "maximum": 10},
-                "suckMode": {"type": "integer", "description": "吮吸模式，0关闭，1‑5", "minimum": 0, "maximum": 5},
-                "suck": {"type": "integer", "description": "吮吸强度，0关闭，1‑10", "minimum": 0, "maximum": 10},
-                "thrust": {"type": "integer", "description": "伸缩档位，0关闭，1‑7", "minimum": 0, "maximum": 7},
-                "heat": {"type": "integer", "description": "加热，0关闭，1开启", "enum": [0, 1]}
+        "name":"set_device_cmd",
+        "description":"设备控制：吮吸模式1‑5，吮吸强度1‑10；震动模式1‑10，震动强度1‑10；autoMode=1开启自动模式(与普通震动互斥，需要保活)；autoStrength自动模式强度0‑255；伸缩1‑7；heat 0关闭/1开启；传0代表关闭该功能。注意autoMode开启后普通震动会被覆盖。",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "vibrateMode":{"type":"integer","description":"震动模式1‑10","minimum":1,"maximum":10},
+                "vibrate":{"type":"integer","description":"震动强度0关闭，1‑10","minimum":0,"maximum":10},
+                "suckMode":{"type":"integer","description":"吮吸模式0关闭，1‑5","minimum":0,"maximum":5},
+                "suck":{"type":"integer","description":"吮吸强度0关闭，1‑10","minimum":0,"maximum":10},
+                "autoMode":{"type":"integer","description":"自动模式 0关闭，1开启；和普通震动互斥","minimum":0,"maximum":1},
+                "autoStrength":{"type":"integer","description":"自动模式强度0‑255","minimum":0,"maximum":255},
+                "thrust":{"type":"integer","description":"伸缩档位0关闭，1‑7","minimum":0,"maximum":7},
+                "heat":{"type":"integer","description":"加热0关闭，1开启","enum":[0,1]}
             },
-            "additionalProperties": False
+            "additionalProperties":False
         }
     },
-    {
-        "name": "stop_all_device",
-        "description": "紧急全局停止所有设备动作，全部通道置0",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}
-    },
-    {
-        "name": "get_device_status",
-        "description": "获取桥接状态、当前设备运行参数",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}
-    }
+    {"name":"stop_all_device","description":"紧急停止全部设备动作，包含自动模式","inputSchema":{"type":"object","properties":{},"additionalProperties":False}},
+    {"name":"get_device_status","description":"获取桥接与设备当前状态，包含autoMode状态","inputSchema":{"type":"object","properties":{},"additionalProperties":False}}
 ]
 
 sessions: Dict[str, Any] = {}
 
-
 @app.get("/mcp")
-async def mcp_sse(request: Request):
+async def mcp_sse(request:Request):
     import uuid
-    session_id = str(uuid.uuid4())
-    sessions[session_id] = {"queue": []}
-
-    async def event_generator():
+    sid = str(uuid.uuid4())
+    sessions[sid] = {"queue":[]}
+    async def gen():
         try:
-            yield {"event": "endpoint", "data": f"/mcp?sessionId={session_id}"}
+            yield {"event":"endpoint","data":f"/mcp?sessionId={sid}"}
             init_msg = {
-                "jsonrpc": "2.0",
-                "method": "server/info",
-                "result": {
-                    "name": "sl278k‑bridge‑sse",
-                    "version": "1.0.0",
-                    "tools": MCP_TOOLS_DEF
-                }
+                "jsonrpc":"2.0","method":"server/info",
+                "result":{"name":"sl278‑bridge‑sse","version":"1.2.0","tools":MCP_TOOLS_DEF}
             }
-            yield {"event": "message", "data": json.dumps(init_msg)}
+            yield {"event":"message","data":json.dumps(init_msg)}
             while True:
                 if await request.is_disconnected():
                     break
-                q = sessions[session_id]["queue"]
+                q = sessions[sid]["queue"]
                 while q:
                     item = q.pop(0)
-                    yield {"event": "message", "data": json.dumps(item)}
+                    yield {"event":"message","data":json.dumps(item)}
                 await asyncio.sleep(0.05)
         finally:
-            if session_id in sessions:
-                del sessions[session_id]
-    return EventSourceResponse(event_generator())
+            if sid in sessions:
+                del sessions[sid]
+    return EventSourceResponse(gen())
 
 
 @app.post("/mcp")
-async def mcp_post(request: Request, sessionId: str | None = None):
+async def mcp_post(request:Request,sessionId:str|None=None):
     body = await request.json()
     if not sessionId or sessionId not in sessions:
-        return Response(json.dumps({"error": "invalid session"}), status_code=400)
-
+        return Response(json.dumps({"error":"invalid session"}),status_code=400)
     msg_id = body.get("id")
     method = body.get("method")
-    params = body.get("params", {})
-    resp = {"jsonrpc": "2.0", "id": msg_id}
+    params = body.get("params",{})
+    resp = {"jsonrpc":"2.0","id":msg_id}
 
     if method == "tools/call":
-        tool_name = params["name"]
-        args = params.get("arguments", {})
-        if tool_name == "set_device_cmd":
+        tname = params["name"]
+        args = params.get("arguments",{})
+        if tname == "set_device_cmd":
             b = CmdBody(**args)
             set_cmd(b)
-            resp["result"] = {"content": [{"type": "text", "text": "ok: set_device_cmd executed"}]}
-        elif tool_name == "stop_all_device":
+            resp["result"]={"content":[{"type":"text","text":"ok: set_device_cmd executed"}]}
+        elif tname == "stop_all_device":
             stop_all()
-            resp["result"] = {"content": [{"type": "text", "text": "ok: all stopped"}]}
-        elif tool_name == "get_device_status":
+            resp["result"]={"content":[{"type":"text","text":"ok: all stopped, include autoMode"}]}
+        elif tname == "get_device_status":
             data = status()
-            resp["result"] = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
+            resp["result"]={"content":[{"type":"text","text":json.dumps(data,ensure_ascii=False)}]}
         else:
-            resp["error"] = {"code": -32601, "message": "unknown tool"}
+            resp["error"]={"code":-32601,"message":"unknown tool"}
     else:
-        resp["result"] = {}
-
+        resp["result"]={}
     sessions[sessionId]["queue"].append(resp)
-    return {"ok": True}
+    return {"ok":True}
 
 
 if __name__ == "__main__":
