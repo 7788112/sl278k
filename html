@@ -35,7 +35,6 @@ let writeChar=null;
 let pollTimer=null;
 let emergencyStopFlag = false;
 
-// 同步后端字段，增加 suckMode
 let lastCmd={vibrateMode:1, vibrate:0, suckMode:0, suck:0, thrust:0, heat:0,timestamp:0};
 
 const logDiv=document.getElementById("log");
@@ -71,34 +70,26 @@ async function connectBle(){
 }
 
 // ==========各个通道独立停止帧==========
-//0x03震动停止
 function stopVibrate(){return new Uint8Array([0x55,0x03,0x00,0x00,0x00,0x00,0x00]);}
-//0x09吮吸停止（更新为新命令码）
 function stopSuck(){return new Uint8Array([0x55,0x09,0x00,0x00,0x00,0x00,0x00]);}
-//0x08伸缩停止
 function stopThrust(){return new Uint8Array([0x55,0x08,0x00,0x00,0x00,0x00,0x00]);}
-//0x04自动模式停止
 function stopAutoMode(){return new Uint8Array([0x55,0x04,0x00,0x00,0x00,0x00,0xAA]);}
-//0x05加热关闭
 function stopHeat(){return new Uint8Array([0x55,0x05,0x00,0x00,0x00,0x00,0x00]);}
 
-//0x03震动 frame mode:1‑10 level:1‑10
 function makeVibrateFrame(mode,level){
     return new Uint8Array([0x55,0x03,0x00,0x00,mode,level,0x00]);
 }
 
-// ✅新吮吸帧 0x09：55 09 00 00 [suckMode] [强度] 00，强度0‑10
+// 吮吸帧：55 09 00 00 [模式(1‑5)] [强度(1‑10)] 00
 function makeSuckFrame(suckMode, level){
+    const m = Math.max(0, Math.min(5, suckMode ?? 0));
     const lvl = Math.max(0, Math.min(10, level));
-    const m = suckMode ?? 0;
     return new Uint8Array([0x55,0x09,0x00,0x00, m & 0xFF, lvl & 0xFF, 0x00]);
 }
 
-//0x08伸缩 thrust档位1‑7
 function makeThrustFrame(level){
     return new Uint8Array([0x55,0x08,0x00,0x00,level,0x00,0x00]);
 }
-//0x05加热 temp摄氏度 0x37=55℃
 function makeHeatFrame(isOn){
     if(isOn){
         return new Uint8Array([0x55,0x05,0x01,0x37,0x00,0x00,0x00]);
@@ -123,7 +114,6 @@ async function writeCmd(cmd){
     }
     log("📤准备输出指令："+JSON.stringify(cmd));
 
-    //震动0x03
     if(cmd.vibrate>0){
         const mode = Math.max(1,Math.min(10,cmd.vibrateMode||1));
         const lvl = Math.max(1,Math.min(10,cmd.vibrate));
@@ -136,9 +126,8 @@ async function writeCmd(cmd){
         await sleep(60);
     }
 
-    // ✅吮吸 0x09，读取suckMode
     if(cmd.suck>0){
-        const suckMode = cmd.suckMode ?? 0;
+        const suckMode = cmd.suckMode ?? 1;
         const lvl=Math.max(1,Math.min(10,cmd.suck));
         const fSuck=makeSuckFrame(suckMode, lvl);
         console.log("0x09吮吸帧",Array.from(fSuck));
@@ -149,7 +138,6 @@ async function writeCmd(cmd){
         await sleep(60);
     }
 
-    //伸缩 thrust 0x08
     if(cmd.thrust>0){
         const lvl=Math.max(1,Math.min(7,cmd.thrust));
         const fThrust=makeThrustFrame(lvl);
@@ -161,7 +149,6 @@ async function writeCmd(cmd){
         await sleep(60);
     }
 
-    //加热
     const fHeat=makeHeatFrame(cmd.heat>0);
     console.log("0x05加热帧",Array.from(fHeat));
     await writeChar.writeValueWithoutResponse(fHeat);
@@ -192,7 +179,6 @@ function startPoll(){
     log("⏱开始轮询服务器指令");
 }
 
-//全通道独立停止，每个部件发自己的停止帧，间隔60ms
 async function stopAll(){
     emergencyStopFlag = true;
     lastCmd={vibrateMode:1, vibrate:0,suckMode:0, suck:0,thrust:0,heat:0,timestamp:0};
