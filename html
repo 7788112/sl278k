@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh‑CN">
 <head>
-<meta charset="utf‑8">
+<meta charset="utf-8">
 <title>SL278 BLE Bridge Client（带0x04自动模式）</title>
 <style>
 body{font-family:system-ui;max-width:800px;margin:12px;}
@@ -26,12 +26,14 @@ const CONNECT_BTN = document.getElementById('connectBtn');
 const STOP_BTN = document.getElementById('fullStopBtn');
 const LOG_PRE = document.getElementById('log');
 
+const SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb';
+const WRITE_CHAR_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb';
+
 let device = null;
 let writeChar = null;
 let pollTimer = null;
 let autoKeepAliveTimer = null;
 
-// 发送帧队列，强制帧间隔60ms
 const frameQueue = [];
 let queueBusy = false;
 
@@ -52,19 +54,19 @@ async function drainQueue(){
     while(frameQueue.length>0){
         const f = frameQueue.shift();
         try{
-            await writeChar.writeWithoutResponse(f);
+            // 修复：API方法名 writeValueWithoutResponse
+            await writeChar.writeValueWithoutResponse(f);
             log("TX: "+ Array.from(f).map(x=>x.toString(16).padStart(2,'0')).join(" "));
         }catch(e){
             log("发送失败 "+e.message);
         }
-        await sleep(60); //协议强制间隔≥60ms
+        await sleep(60);
     }
     queueBusy = false;
 }
 
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
-// 帧生成逻辑（和后端保持一致）
 function buildSuckFrame(mode,intensity){
     return new Uint8Array([0x55,0x09,0x00,0x00,mode,intensity,0x00]);
 }
@@ -88,7 +90,6 @@ function buildHeatFrame(on,temp=52){
 
 let lastState = null;
 
-// poll轮询后端状态
 async function pollServer(){
     const base = SERVER_INPUT.value.trim();
     try{
@@ -98,7 +99,6 @@ async function pollServer(){
             lastState = JSON.parse(JSON.stringify(state));
             return;
         }
-        // 对比状态变更，发送对应硬件帧
         await diffAndSend(lastState, state);
         lastState = JSON.parse(JSON.stringify(state));
     }catch(err){
@@ -107,15 +107,12 @@ async function pollServer(){
 }
 
 async function diffAndSend(oldS, newS){
-    // 吮吸变化
     if(oldS.suckMode !== newS.suckMode || oldS.suck !== newS.suck){
         await sendFrame(buildSuckFrame(newS.suckMode, newS.suck));
     }
-    //普通震动变化
     if(oldS.vibrateMode !== newS.vibrateMode || oldS.vibrate !== newS.vibrate){
         await sendFrame(buildVibrateFrame(newS.vibrateMode, newS.vibrate));
     }
-    //自动模式处理：开启则启动1500ms保活定时器；关闭销毁定时器发送停止帧
     if(oldS.autoMode !== newS.autoMode || oldS.autoStrength !== newS.autoStrength){
         if(autoKeepAliveTimer) clearInterval(autoKeepAliveTimer);
         if(newS.autoMode ===1){
@@ -129,17 +126,14 @@ async function diffAndSend(oldS, newS){
             await sendFrame(buildAutoFrame(false,0));
         }
     }
-    //伸缩
     if(oldS.thrust !== newS.thrust){
         await sendFrame(buildThrustFrame(newS.thrust));
     }
-    //加热
     if(oldS.heat !== newS.heat){
         await sendFrame(buildHeatFrame(!!newS.heat));
     }
 }
 
-// 全部停止，调用后端stop接口，拿到全部停止帧序列依次发送
 async function fullHardwareStop(){
     log("执行全部硬件停止");
     if(autoKeepAliveTimer){
@@ -149,30 +143,35 @@ async function fullHardwareStop(){
     const base = SERVER_INPUT.value.trim();
     const res = await fetch(base+"/stop",{method:"POST"});
     const data = await res.json();
-    //后端返回hex字符串数组 stop_frames_hex
     for(const hexStr of data.stop_frames_hex){
         const arr = hexStr.split(" ").map(s=>parseInt(s,16));
         await sendFrame(new Uint8Array(arr));
     }
 }
 
-// 蓝牙连接
 CONNECT_BTN.onclick = async ()=>{
     try{
         log("开始扫描SL278设备");
         device = await navigator.bluetooth.requestDevice({
             filters:[{namePrefix:"SL278"}],
-            optionalServices:["ffe0"]
+            optionalServices:[SERVICE_UUID]
         });
+        // 增加断开监听，与老版本可用代码保持一致
+        device.addEventListener('gattserverdisconnected', ()=>{
+            log("⚠️蓝牙断开");
+            writeChar = null;
+        });
+
         const gatt = await device.gatt.connect();
-        const service = await gatt.getPrimaryService(0xffe0);
-        writeChar = await service.getCharacteristic(0xffe1);
-        log("BLE已连接 ffe1 write‑without‑response");
-        //启动poll
+        const service = await gatt.getPrimaryService(SERVICE_UUID);
+        writeChar = await service.getCharacteristic(WRITE_CHAR_UUID);
+        log("✅BLE已连接 ffe1 write‑without‑response");
+
         if(pollTimer) clearInterval(pollTimer);
         pollTimer = setInterval(pollServer,400);
     }catch(e){
         log("连接失败："+e.message);
+        console.error(e);
     }
 };
 
