@@ -1,7 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import time
+import json
+import asyncio
+from typing import Dict, Any
+from sse_starlette.sse import EventSourceResponse
 
 app = FastAPI()
 
@@ -15,8 +19,8 @@ app.add_middleware(
 current_command = {
     "vibrateMode": 1,
     "vibrate": 0,
-    "suckMode": 0,    # 新增：吮吸模式
-    "suck": 0,        # 吮吸强度 0~10，0停止
+    "suckMode": 0,
+    "suck": 0,
     "thrust": 0,
     "heat": 0,
     "timestamp": 0
@@ -27,24 +31,10 @@ bridge_status = {"last_poll": 0}
 class CmdBody(BaseModel):
     vibrateMode: int | None = None
     vibrate: int | None = None
-    suckMode: int | None = None  # 新增吮吸模式入参
+    suckMode: int | None = None
     suck: int | None = None
     thrust: int | None = None
     heat: int | None = None
-
-
-# 根据 suckMode、suck强度 生成吮吸串口帧 55 09 00 00 [mode] [intensity] 00
-def build_suck_frame(mode: int, intensity: int) -> bytearray:
-    intensity = max(0, min(intensity, 10))
-    return bytearray([
-        0x55,
-        0x09,
-        0x00,
-        0x00,
-        mode & 0xFF,
-        intensity & 0xFF,
-        0x00
-    ])
 
 
 @app.post("/cmd")
@@ -58,11 +48,14 @@ def set_cmd(body: CmdBody):
         else:
             current_command["vibrate"] = max(1, min(10, body.vibrate))
 
-    # 吮吸模式
+    # 吮吸模式 1‑5，0为停止
     if body.suckMode is not None:
-        current_command["suckMode"] = body.suckMode
+        if body.suckMode <= 0:
+            current_command["suckMode"] = 0
+        else:
+            current_command["suckMode"] = max(1, min(5, body.suckMode))
 
-    # 吮吸强度：0~10，0停止
+    # 吮吸强度 1‑10，0关闭
     if body.suck is not None:
         if body.suck <= 0:
             current_command["suck"] = 0
@@ -109,7 +102,21 @@ def stop_all():
     return {"status": "stopped"}
 
 
-# 【可选调试接口】直接返回生成好的吮吸十六进制帧，测试用，桥接可以不用调用
+def build_suck_frame(mode: int, intensity: int):
+    """帧: 55 09 00 00 [mode] [intensity] 00"""
+    mode = max(0, min(5, mode))
+    intensity = max(0, min(10, intensity))
+    return bytearray([
+        0x55,
+        0x09,
+        0x00,
+        0x00,
+        mode & 0xFF,
+        intensity & 0xFF,
+        0x00
+    ])
+
+
 @app.get("/debug/suck_frame")
 def debug_suck(mode: int = 2, intensity: int = 5):
     frame_bytes = build_suck_frame(mode, intensity)
@@ -118,7 +125,105 @@ def debug_suck(mode: int = 2, intensity: int = 5):
         "bytes": list(frame_bytes)
     }
 
+# ================= MCP SSE /mcp =================
+MCP_TOOLS_DEF = [
+    {
+        "name": "set_device_cmd",
+        "description": "下发设备控制指令。吮吸模式1‑5，吮吸强度1‑10；震动模式1‑10，震动强度1‑10；伸缩1‑7；heat 0/1。字段为0代表关闭该功能。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vibrateMode": {"type": "integer", "description": "震动模式 1‑10", "minimum": 1, "maximum": 10},
+                "vibrate": {"type": "integer", "description": "震动强度，0关闭，1‑10", "minimum": 0, "maximum": 10},
+                "suckMode": {"type": "integer", "description": "吮吸模式，0关闭，1‑5", "minimum": 0, "maximum": 5},
+                "suck": {"type": "integer", "description": "吮吸强度，0关闭，1‑10", "minimum": 0, "maximum": 10},
+                "thrust": {"type": "integer", "description": "伸缩档位，0关闭，1‑7", "minimum": 0, "maximum": 7},
+                "heat": {"type": "integer", "description": "加热，0关闭，1开启", "enum": [0, 1]}
+            },
+            "additionalProperties": False
+        }
+    },
+    {
+        "name": "stop_all_device",
+        "description": "紧急全局停止所有设备动作，全部通道置0",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}
+    },
+    {
+        "name": "get_device_status",
+        "description": "获取桥接状态、当前设备运行参数",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}
+    }
+]
+
+sessions: Dict[str, Any] = {}
+
+
+@app.get("/mcp")
+async def mcp_sse(request: Request):
+    import uuid
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = {"queue": []}
+
+    async def event_generator():
+        try:
+            yield {"event": "endpoint", "data": f"/mcp?sessionId={session_id}"}
+            init_msg = {
+                "jsonrpc": "2.0",
+                "method": "server/info",
+                "result": {
+                    "name": "sl278k‑bridge‑sse",
+                    "version": "1.0.0",
+                    "tools": MCP_TOOLS_DEF
+                }
+            }
+            yield {"event": "message", "data": json.dumps(init_msg)}
+            while True:
+                if await request.is_disconnected():
+                    break
+                q = sessions[session_id]["queue"]
+                while q:
+                    item = q.pop(0)
+                    yield {"event": "message", "data": json.dumps(item)}
+                await asyncio.sleep(0.05)
+        finally:
+            if session_id in sessions:
+                del sessions[session_id]
+    return EventSourceResponse(event_generator())
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request, sessionId: str | None = None):
+    body = await request.json()
+    if not sessionId or sessionId not in sessions:
+        return Response(json.dumps({"error": "invalid session"}), status_code=400)
+
+    msg_id = body.get("id")
+    method = body.get("method")
+    params = body.get("params", {})
+    resp = {"jsonrpc": "2.0", "id": msg_id}
+
+    if method == "tools/call":
+        tool_name = params["name"]
+        args = params.get("arguments", {})
+        if tool_name == "set_device_cmd":
+            b = CmdBody(**args)
+            set_cmd(b)
+            resp["result"] = {"content": [{"type": "text", "text": "ok: set_device_cmd executed"}]}
+        elif tool_name == "stop_all_device":
+            stop_all()
+            resp["result"] = {"content": [{"type": "text", "text": "ok: all stopped"}]}
+        elif tool_name == "get_device_status":
+            data = status()
+            resp["result"] = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
+        else:
+            resp["error"] = {"code": -32601, "message": "unknown tool"}
+    else:
+        resp["result"] = {}
+
+    sessions[sessionId]["queue"].append(resp)
+    return {"ok": True}
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8899)
+    uvicorn.run(app, host="0.0.0.0", port=8899)
