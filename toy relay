@@ -1,0 +1,124 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import time
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+current_command = {
+    "vibrateMode": 1,
+    "vibrate": 0,
+    "suckMode": 0,    # 新增：吮吸模式
+    "suck": 0,        # 吮吸强度 0~16，0停止
+    "thrust": 0,
+    "heat": 0,
+    "timestamp": 0
+}
+bridge_status = {"last_poll": 0}
+
+
+class CmdBody(BaseModel):
+    vibrateMode: int | None = None
+    vibrate: int | None = None
+    suckMode: int | None = None  # 新增吮吸模式入参
+    suck: int | None = None
+    thrust: int | None = None
+    heat: int | None = None
+
+
+# 根据 suckMode、suck强度 生成吮吸串口帧 55 09 00 00 [mode] [intensity] 00
+def build_suck_frame(mode: int, intensity: int) -> bytearray:
+    intensity = max(0, min(intensity, 16))
+    return bytearray([
+        0x55,
+        0x09,
+        0x00,
+        0x00,
+        mode & 0xFF,
+        intensity & 0xFF,
+        0x00
+    ])
+
+
+@app.post("/cmd")
+def set_cmd(body: CmdBody):
+    if body.vibrateMode is not None:
+        current_command["vibrateMode"] = max(1, min(10, body.vibrateMode))
+
+    if body.vibrate is not None:
+        if body.vibrate <= 0:
+            current_command["vibrate"] = 0
+        else:
+            current_command["vibrate"] = max(1, min(10, body.vibrate))
+
+    # 吮吸模式
+    if body.suckMode is not None:
+        current_command["suckMode"] = body.suckMode
+
+    # 吮吸强度：0~16，0停止
+    if body.suck is not None:
+        if body.suck <= 0:
+            current_command["suck"] = 0
+        else:
+            current_command["suck"] = max(1, min(16, body.suck))
+
+    if body.thrust is not None:
+        if body.thrust <= 0:
+            current_command["thrust"] = 0
+        else:
+            current_command["thrust"] = max(1, min(7, body.thrust))
+
+    if body.heat is not None:
+        if body.heat <= 0:
+            current_command["heat"] = 0
+        else:
+            current_command["heat"] = 1
+
+    current_command["timestamp"] = time.time()
+    return {"status": "ok", "cmd": current_command}
+
+
+@app.get("/poll")
+def poll():
+    bridge_status["last_poll"] = time.time()
+    return current_command
+
+
+@app.get("/status")
+def status():
+    alive = (time.time() - bridge_status["last_poll"]) < 10
+    return {"bridge_alive": alive, "current": current_command}
+
+
+@app.post("/stop")
+def stop_all():
+    current_command["vibrateMode"] = 1
+    current_command["vibrate"] = 0
+    current_command["suckMode"] = 0
+    current_command["suck"] = 0
+    current_command["thrust"] = 0
+    current_command["heat"] = 0
+    current_command["timestamp"] = time.time()
+    return {"status": "stopped"}
+
+
+# 【可选调试接口】直接返回生成好的吮吸十六进制帧，测试用，桥接可以不用调用
+@app.get("/debug/suck_frame")
+def debug_suck(mode: int = 2, intensity: int = 5):
+    frame_bytes = build_suck_frame(mode, intensity)
+    return {
+        "hex": frame_bytes.hex(" "),
+        "bytes": list(frame_bytes)
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8899)
